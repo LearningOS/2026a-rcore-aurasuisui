@@ -11,6 +11,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+/// Bias used by stride scheduling; larger means finer granularity.
+pub const BIG_STRIDE: usize = 1 << 16;
+/// Default priority of a task (>= 2 as required by stride scheduling).
+pub const DEFAULT_PRIO: usize = 16;
+
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -71,6 +77,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Current stride used by the stride scheduler
+    pub stride: usize,
+
+    /// Stride increment per scheduling round (`BIG_STRIDE / priority`)
+    pub pass: usize,
 }
 
 impl TaskControlBlockInner {
@@ -135,6 +147,8 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    stride: 0,
+                    pass: BIG_STRIDE / DEFAULT_PRIO,
                 })
             },
         };
@@ -216,6 +230,8 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    stride: parent_inner.stride,
+                    pass: parent_inner.pass,
                 })
             },
         });
@@ -229,6 +245,66 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+    /// Create a new process from an ELF image (used by `spawn`).
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: vec![
+                        Some(Arc::new(Stdin)),
+                        Some(Arc::new(Stdout)),
+                        Some(Arc::new(Stdout)),
+                    ],
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    stride: 0,
+                    pass: BIG_STRIDE / DEFAULT_PRIO,
+                })
+            },
+        });
+        self.inner_exclusive_access()
+            .children
+            .push(task_control_block.clone());
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        task_control_block
+    }
+
+    /// Set the priority of this process for stride scheduling.
+    pub fn set_priority(&self, prio: isize) -> isize {
+        if prio < 2 {
+            return -1;
+        }
+        let mut inner = self.inner_exclusive_access();
+        inner.pass = BIG_STRIDE / prio as usize;
+        inner.stride = 0;
+        prio
     }
 
     /// get pid of process
@@ -256,6 +332,10 @@ impl TaskControlBlock {
         };
         if result {
             inner.program_brk = new_brk as usize;
+            // Page tables changed: drop stale TLB entries.
+            unsafe {
+                core::arch::asm!("sfence.vma");
+            }
             Some(old_break)
         } else {
             None

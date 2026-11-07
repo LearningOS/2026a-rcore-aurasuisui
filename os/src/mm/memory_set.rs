@@ -318,6 +318,73 @@ impl MemorySet {
             false
         }
     }
+
+    /// Map `len` bytes of anonymous memory at `start`.
+    /// `port`: bit0 = R, bit1 = W, bit2 = X.
+    pub fn mmap(&mut self, start: usize, len: usize, port: usize) -> isize {
+        if start % PAGE_SIZE != 0 {
+            return -1;
+        }
+        if port & (!0x7) != 0 || port & 0x7 == 0 {
+            return -1;
+        }
+        let page_num = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+        let start_vpn = VirtPageNum::from(start / PAGE_SIZE);
+        let end_vpn = VirtPageNum::from(start / PAGE_SIZE + page_num);
+        for area in self.areas.iter() {
+            let a_start = area.vpn_range.get_start().0;
+            let a_end = area.vpn_range.get_end().0;
+            if start_vpn.0 < a_end && a_start < end_vpn.0 {
+                return -1;
+            }
+        }
+        let mut perm = MapPermission::U;
+        if port & 0x1 != 0 {
+            perm |= MapPermission::R;
+        }
+        if port & 0x2 != 0 {
+            perm |= MapPermission::W;
+        }
+        if port & 0x4 != 0 {
+            perm |= MapPermission::X;
+        }
+        self.push(
+            MapArea::new(
+                VirtAddr::from(start),
+                VirtAddr::from(start + page_num * PAGE_SIZE),
+                MapType::Framed,
+                perm,
+            ),
+            None,
+        );
+        unsafe {
+            core::arch::asm!("sfence.vma");
+        }
+        0
+    }
+
+    /// Unmap an area previously created by `mmap`.
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        if start % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
+            return -1;
+        }
+        let start_vpn = start / PAGE_SIZE;
+        let end_vpn = start_vpn + len / PAGE_SIZE;
+        let pos = self.areas.iter().position(|area| {
+            area.vpn_range.get_start().0 == start_vpn && area.vpn_range.get_end().0 == end_vpn
+        });
+        match pos {
+            Some(idx) => {
+                let mut area = self.areas.remove(idx);
+                area.unmap(&mut self.page_table);
+                unsafe {
+                    core::arch::asm!("sfence.vma");
+                }
+                0
+            }
+            None => -1,
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
