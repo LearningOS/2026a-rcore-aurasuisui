@@ -1,6 +1,8 @@
 //! Synchronization and interior mutability primitives
 
 mod condvar;
+/// deadlock detection
+pub mod deadlock;
 mod mutex;
 mod semaphore;
 mod up;
